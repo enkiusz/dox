@@ -1,0 +1,566 @@
+#!/usr/bin/env bash
+
+#
+# dox - document management tools for hackerspaces
+# Maciej Grela <enki@fsck.pl>
+
+# Based on the pass tool by Jason Donenfeld.
+
+# Copyright (C) 2012 - 2018 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
+# This file is licensed under the GPLv2+. Please see COPYING for more information.
+
+umask "${DOCUMENT_STORE_UMASK:-077}"
+set -o pipefail
+
+GPG_OPTS=( $DOCUMENT_STORE_GPG_OPTS "--quiet" "--yes" "--compress-algo=none" "--no-encrypt-to" )
+GPG="gpg"
+export GPG_TTY="${GPG_TTY:-$(tty 2>/dev/null)}"
+which gpg2 &>/dev/null && GPG="gpg2"
+[[ -n $GPG_AGENT_INFO || $GPG == "gpg2" ]] && GPG_OPTS+=( "--batch" "--use-agent" )
+
+PREFIX="${DOCUMENT_STORE_DIR:-$HOME/.document-store}"
+EXTENSIONS="${DOCUMENT_STORE_EXTENSIONS_DIR:-$PREFIX/.extensions}"
+
+LIBDIR="$(dirname "$0")" # LIBRARY_DIRECTORY
+
+export GIT_CEILING_DIRECTORIES="$PREFIX/.."
+
+#
+# BEGIN helper functions
+#
+
+set_git() {
+	INNER_GIT_DIR="${1%/*}"
+	while [[ ! -d $INNER_GIT_DIR && ${INNER_GIT_DIR%/*}/ == "${PREFIX%/}/"* ]]; do
+		INNER_GIT_DIR="${INNER_GIT_DIR%/*}"
+	done
+	[[ $(git -C "$INNER_GIT_DIR" rev-parse --is-inside-work-tree 2>/dev/null) == true ]] || INNER_GIT_DIR=""
+}
+git_add_file() {
+	[[ -n $INNER_GIT_DIR ]] || return
+	git -C "$INNER_GIT_DIR" add "$1" || return
+	[[ -n $(git -C "$INNER_GIT_DIR" status --porcelain "$1") ]] || return
+	git_commit "$2"
+}
+git_commit() {
+	local sign=""
+	[[ -n $INNER_GIT_DIR ]] || return
+	[[ $(git -C "$INNER_GIT_DIR" config --bool --get dox.signcommits) == "true" ]] && sign="-S"
+	git -C "$INNER_GIT_DIR" commit $sign -m "$1"
+}
+yesno() {
+	[[ -t 0 ]] || return 0
+	local response
+	read -r -p "$1 [y/N] " response
+	[[ $response == [yY] ]] || exit 1
+}
+die() {
+	echo "$@" >&2
+	exit 1
+}
+verify_file() {
+	[[ -n $DOCUMENT_STORE_SIGNING_KEY ]] || return 0
+	[[ -f $1.sig ]] || die "Signature for $1 does not exist."
+	local fingerprints="$($GPG $DOCUMENT_STORE_GPG_OPTS --verify --status-fd=1 "$1.sig" "$1" 2>/dev/null | sed -n 's/^\[GNUPG:\] VALIDSIG \([A-F0-9]\{40\}\) .* \([A-F0-9]\{40\}\)$/\1\n\2/p')"
+	local fingerprint found=0
+	for fingerprint in $DOCUMENT_STORE_SIGNING_KEY; do
+		[[ $fingerprint =~ ^[A-F0-9]{40}$ ]] || continue
+		[[ $fingerprints == *$fingerprint* ]] && { found=1; break; }
+	done
+	[[ $found -eq 1 ]] || die "Signature for $1 is invalid."
+}
+set_gpg_recipients() {
+	GPG_RECIPIENT_ARGS=( )
+	GPG_RECIPIENTS=( )
+
+	if [[ -n $DOCUMENT_STORE_KEY ]]; then
+		for gpg_id in $DOCUMENT_STORE_KEY; do
+			GPG_RECIPIENT_ARGS+=( "-r" "$gpg_id" )
+			GPG_RECIPIENTS+=( "$gpg_id" )
+		done
+		return
+	fi
+
+	local current="$PREFIX/$1"
+	while [[ $current != "$PREFIX" && ! -f $current/.gpg-id ]]; do
+		current="${current%/*}"
+	done
+	current="$current/.gpg-id"
+
+	if [[ ! -f $current ]]; then
+		cat >&2 <<-_EOF
+		Error: You must run:
+		    $PROGRAM init your-gpg-id
+		before you may use the document store.
+
+		_EOF
+		cmd_usage
+		exit 1
+	fi
+
+	verify_file "$current"
+
+	local gpg_id
+	while read -r gpg_id; do
+		GPG_RECIPIENT_ARGS+=( "-r" "$gpg_id" )
+		GPG_RECIPIENTS+=( "$gpg_id" )
+	done < "$current"
+}
+
+reencrypt_path() {
+	local prev_gpg_recipients="" gpg_keys="" current_keys="" index doxfile
+	local groups="$($GPG $DOCUMENT_STORE_GPG_OPTS --list-config --with-colons | grep "^cfg:group:.*")"
+	while read -r -d "" doxfile; do
+		[[ -L $doxfile ]] && continue
+		local doxfile_dir="${doxfile%/*}"
+		doxfile_dir="${doxfile_dir#$PREFIX}"
+		doxfile_dir="${doxfile_dir#/}"
+		local doxfile_display="${doxfile#$PREFIX/}"
+		doxfile_display="${doxfile_display%.gpg}"
+		local doxfile_temp="${doxfile}.tmp.${RANDOM}.${RANDOM}.${RANDOM}.${RANDOM}.--"
+
+		set_gpg_recipients "$doxfile_dir"
+		if [[ $prev_gpg_recipients != "${GPG_RECIPIENTS[*]}" ]]; then
+			for index in "${!GPG_RECIPIENTS[@]}"; do
+				local group="$(sed -n "s/^cfg:group:$(sed 's/[\/&]/\\&/g' <<<"${GPG_RECIPIENTS[$index]}"):\\(.*\\)\$/\\1/p" <<<"$groups" | head -n 1)"
+				[[ -z $group ]] && continue
+				IFS=";" eval 'GPG_RECIPIENTS+=( $group )' # http://unix.stackexchange.com/a/92190
+				unset "GPG_RECIPIENTS[$index]"
+			done
+			gpg_keys="$($GPG $DOCUMENT_STORE_GPG_OPTS --list-keys --with-colons "${GPG_RECIPIENTS[@]}" | sed -n 's/^sub:[^idr:]*:[^:]*:[^:]*:\([^:]*\):[^:]*:[^:]*:[^:]*:[^:]*:[^:]*:[^:]*:[a-zA-Z]*e[a-zA-Z]*:.*/\1/p' | LC_ALL=C sort -u)"
+		fi
+		current_keys="$(LC_ALL=C $GPG $DOCUMENT_STORE_GPG_OPTS -v --no-secmem-warning --no-permission-warning --decrypt --list-only --keyid-format long "$doxfile" 2>&1 | sed -n 's/^gpg: public key is \([A-F0-9]\{1,\}\)$/\1/p' | LC_ALL=C sort -u)"
+
+		if [[ $gpg_keys != "$current_keys" ]]; then
+			echo "$doxfile_display: reencrypting to ${gpg_keys//$'\n'/ }"
+			$GPG -d "${GPG_OPTS[@]}" "$doxfile" | $GPG -e "${GPG_RECIPIENT_ARGS[@]}" -o "$doxfile_temp" "${GPG_OPTS[@]}" &&
+			mv "$doxfile_temp" "$doxfile" || rm -f "$doxfile_temp"
+		fi
+		prev_gpg_recipients="${GPG_RECIPIENTS[*]}"
+	done < <(find "$1" -path '*/.git' -prune -o -iname '*.gpg' -print0)
+}
+check_sneaky_paths() {
+	local path
+	for path in "$@"; do
+		[[ $path =~ /\.\.$ || $path =~ ^\.\./ || $path =~ /\.\./ || $path =~ ^\.\.$ ]] && die "Error: You've attempted to pass a sneaky path to $PROGRAM. Go home."
+	done
+}
+
+#
+# END helper functions
+#
+
+#
+# BEGIN platform definable
+#
+
+tmpdir() {
+	[[ -n $SECURE_TMPDIR ]] && return
+	local warn=1
+	[[ $1 == "nowarn" ]] && warn=0
+	local template="$PROGRAM.XXXXXXXXXXXXX"
+	if [[ -d /dev/shm && -w /dev/shm && -x /dev/shm ]]; then
+		SECURE_TMPDIR="$(mktemp -d "/dev/shm/$template")"
+		remove_tmpfile() {
+			rm -rf "$SECURE_TMPDIR"
+		}
+		trap remove_tmpfile EXIT
+	else
+		[[ $warn -eq 1 ]] && yesno "$(cat <<-_EOF
+		Your system does not have /dev/shm, which means that it may
+		be difficult to entirely erase the temporary non-encrypted
+		document file after editing.
+
+		Are you sure you would like to continue?
+		_EOF
+		)"
+		SECURE_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/$template")"
+		shred_tmpfile() {
+			find "$SECURE_TMPDIR" -type f -exec $SHRED {} +
+			rm -rf "$SECURE_TMPDIR"
+		}
+		trap shred_tmpfile EXIT
+	fi
+
+}
+GETOPT="getopt"
+SHRED="shred -f -z"
+OPENER="xdg-open"
+
+source "$LIBDIR/dox/platform/$(uname | cut -d _ -f 1 | tr '[:upper:]' '[:lower:]').sh" 2>/dev/null
+
+#
+# END platform definable
+#
+
+
+#
+# BEGIN subcommand functions
+#
+
+cmd_version() {
+	cat <<-_EOF
+	=============================================
+	=  dox: the document repo for hackerspaces  =
+	=                                           =
+	=                    v0.7                   =
+	=                                           =
+	=  based on http://www.passwordstore.org/   =
+	=                                           =
+	=============================================
+	_EOF
+}
+
+cmd_usage() {
+	cmd_version
+	echo
+	cat <<-_EOF
+	Usage:
+	    $PROGRAM init [--path=subfolder,-p subfolder] gpg-id...
+	        Initialize new document storage and use gpg-id(s) for encryption.
+	        Selectively reencrypt existing document using new gpg-id(s).
+	    $PROGRAM [ls] [subfolder]
+	        List documents as a tree.
+	    $PROGRAM open [-e,--edit] dox-name
+            1. Decrypt and extract the file into a temporary directory.
+            2. Launch the platform-dependent generic opener (open or xdg-open) on the file. 
+            3. When the opener process exits and reimport file contents (when -e flag is specified and file contents changed).
+            4. Remove the temporary directory.
+	    $PROGRAM grep [GREPOPTIONS] search-string
+	        Search for document files containing search-string when decrypted.
+	    $PROGRAM insert [--path=subfolder,-p subfolder] [-f,--force] filename1 filename2...
+			Insert given files into the document repository under a specified subfolder.
+			Prompt before overwriting existing documents unless forced.
+	    $PROGRAM rm [--recursive,-r] [--force,-f] dox-name
+	        Remove existing document or directory, optionally forcefully.
+	    $PROGRAM mv [--force,-f] old-path new-path
+	        Renames or moves old-path to new-path, optionally forcefully, selectively reencrypting.
+	    $PROGRAM cp [--force,-f] old-path new-path
+	        Copies old-path to new-path, optionally forcefully, selectively reencrypting.
+	    $PROGRAM git git-command-args...
+	        If the document store is a git repository, execute a git command
+	        specified by git-command-args.
+	    $PROGRAM help
+	        Show this text.
+	    $PROGRAM version
+	        Show version information.
+	_EOF
+}
+
+cmd_init() {
+	local opts id_path=""
+	opts="$($GETOPT -o p: -l path: -n "$PROGRAM" -- "$@")"
+	local err=$?
+	eval set -- "$opts"
+	while true; do case $1 in
+		-p|--path) id_path="$2"; shift 2 ;;
+		--) shift; break ;;
+	esac done
+
+	[[ $err -ne 0 || $# -lt 1 ]] && die "Usage: $PROGRAM $COMMAND [--path=subfolder,-p subfolder] gpg-id..."
+	[[ -n $id_path ]] && check_sneaky_paths "$id_path"
+	[[ -n $id_path && ! -d $PREFIX/$id_path && -e $PREFIX/$id_path ]] && die "Error: $PREFIX/$id_path exists but is not a directory."
+
+	local gpg_id="$PREFIX/$id_path/.gpg-id"
+	set_git "$gpg_id"
+
+	if [[ $# -eq 1 && -z $1 ]]; then
+		[[ ! -f "$gpg_id" ]] && die "Error: $gpg_id does not exist and so cannot be removed."
+		rm -v -f "$gpg_id" || exit 1
+		if [[ -n $INNER_GIT_DIR ]]; then
+			git -C "$INNER_GIT_DIR" rm -qr "$gpg_id"
+			git_commit "Deinitialize ${gpg_id}${id_path:+ ($id_path)}."
+		fi
+		rmdir -p "${gpg_id%/*}" 2>/dev/null
+	else
+		mkdir -v -p "$PREFIX/$id_path"
+		printf "%s\n" "$@" > "$gpg_id"
+		local id_print="$(printf "%s, " "$@")"
+		echo "Password store initialized for ${id_print%, }${id_path:+ ($id_path)}"
+		git_add_file "$gpg_id" "Set GPG id to ${id_print%, }${id_path:+ ($id_path)}."
+		if [[ -n $DOCUMENT_STORE_SIGNING_KEY ]]; then
+			local signing_keys=( ) key
+			for key in $DOCUMENT_STORE_SIGNING_KEY; do
+				signing_keys+=( --default-key $key )
+			done
+			$GPG "${GPG_OPTS[@]}" "${signing_keys[@]}" --detach-sign "$gpg_id" || die "Could not sign .gpg_id."
+			key="$($GPG --verify --status-fd=1 "$gpg_id.sig" "$gpg_id" 2>/dev/null | sed -n 's/^\[GNUPG:\] VALIDSIG [A-F0-9]\{40\} .* \([A-F0-9]\{40\}\)$/\1/p')"
+			[[ -n $key ]] || die "Signing of .gpg_id unsuccessful."
+			git_add_file "$gpg_id.sig" "Signing new GPG id with ${key//[$IFS]/,}."
+		fi
+	fi
+
+	reencrypt_path "$PREFIX/$id_path"
+	git_add_file "$PREFIX/$id_path" "Reencrypt document store using new GPG id ${id_print%, }${id_path:+ ($id_path)}."
+}
+
+cmd_show() {
+	local path="$1"
+	local doxfile="$PREFIX/$path.gpg"
+	check_sneaky_paths "$path"
+	if [[ -f $doxfile ]]; then
+		cmd_open "$path"
+	elif [[ -d $PREFIX/$path ]]; then
+		if [[ -z $path ]]; then
+			echo "Document Store"
+		else
+			echo "${path%\/}"
+		fi
+		tree -C -l --noreport "$PREFIX/$path" | tail -n +2 | LC_ALL=C sed -E 's/\.gpg(\x1B\[[0-9]+m)?( ->|$)/\1\2/g' # remove .gpg at end of line, but keep colors
+	elif [[ -z $path ]]; then
+		die "Error: Document store is empty. Try \"$PROGRAM init\"."
+	else
+		die "Error: $path is not in the document store."
+	fi
+}
+
+cmd_open() {
+	local opts edit=''
+	opts="$($GETOPT -o e -l edit -n "$PROGRAM" -- "$@")"
+	local err=$?
+	eval set -- "$opts"
+	while true; do case $1 in
+		-e|--edit) edit="yes"; shift 1 ;;
+		--) shift; break ;;
+	esac done
+
+	[[ $err -ne 0 || $# -lt 1 ]] && die "Usage: $PROGRAM $COMMAND [-e,--edit] dox-name"
+
+	local path="${1%/}"
+	check_sneaky_paths "$path"
+	set_gpg_recipients "$(dirname -- "$path")"
+	local doxfile="$PREFIX/$path.gpg"
+	set_git "$doxfile"
+
+	tmpdir --size=$(stat -f %z -- "$doxfile") #Defines $SECURE_TMPDIR
+
+	local tmp_file="$(mktemp -u "$SECURE_TMPDIR/XXXXXX")-${path//\//-}"
+
+	if [[ -f $doxfile ]]; then
+		$GPG -d -o "$tmp_file" "${GPG_OPTS[@]}" "$doxfile" || exit 1
+	else
+		die "Document $path doesn't exist."
+	fi
+
+	${OPENER} "$tmp_file"
+
+	if [ -n "$edit" ]; then
+		$GPG -d -o - "${GPG_OPTS[@]}" "$doxfile" 2>/dev/null | diff - "$tmp_file" &>/dev/null && die "Document unchanged."
+
+		while ! $GPG -e "${GPG_RECIPIENT_ARGS[@]}" -o "$doxfile" "${GPG_OPTS[@]}" "$tmp_file"; do
+			yesno "GPG encryption failed. Would you like to try again?"
+		done
+		git_add_file "$doxfile" "Changed document $path."
+	fi
+}
+
+cmd_find() {
+	[[ $# -eq 0 ]] && die "Usage: $PROGRAM $COMMAND dox-names..."
+	IFS="," eval 'echo "Search Terms: $*"'
+	local terms="*$(printf '%s*|*' "$@")"
+	tree -C -l --noreport -P "${terms%|*}" --prune --matchdirs --ignore-case "$PREFIX" | tail -n +2 | sed -E 's/\.gpg(\x1B\[[0-9]+m)?( ->|$)/\1\2/g'
+}
+
+cmd_grep() {
+	[[ $# -lt 1 ]] && die "Usage: $PROGRAM $COMMAND [GREPOPTIONS] search-string"
+	local doxfile grepresults
+	while read -r -d "" doxfile; do
+		grepresults="$($GPG -d "${GPG_OPTS[@]}" "$doxfile" | grep --color=always "$@")"
+		[[ $? -ne 0 ]] && continue
+		doxfile="${doxfile%.gpg}"
+		doxfile="${doxfile#$PREFIX/}"
+		local doxfile_dir="${doxfile%/*}/"
+		[[ $doxfile_dir == "${doxfile}/" ]] && doxfile_dir=""
+		doxfile="${doxfile##*/}"
+		printf "\e[94m%s\e[1m%s\e[0m:\n" "$doxfile_dir" "$doxfile"
+		echo "$grepresults"
+	done < <(find -L "$PREFIX" -path '*/.git' -prune -o -iname '*.gpg' -print0)
+}
+
+cmd_insert() {
+	local opts subfolder='/' force=0
+	opts="$($GETOPT -o p:fm: -l path::force::msg -n "$PROGRAM" -- "$@")"
+	local err=$?
+	eval set -- "$opts"
+	while true; do case $1 in
+		-f|--force) force=1; shift ;;
+		-p|--path) subfolder="${2}"; shift 2 ;;
+		--) shift; break ;;
+	esac done
+
+	[[ $err -ne 0 || $# -lt 1 ]] && die "Usage: $PROGRAM $COMMAND [--path=subfolder,-p subfolder] [-f,--force] filename1 filename2..."
+	while [ "$1" ]; do
+		input_file="$1"; shift
+
+		local path="${subfolder%/}/$(basename -- $input_file)"
+		local doxfile="$PREFIX/$path.gpg"
+		check_sneaky_paths "$path"
+		set_git "$doxfile"
+
+		[[ $force -eq 0 && -e $doxfile ]] && yesno "An entry already exists for $path. Overwrite it?"
+
+		mkdir -p -v "$PREFIX/$(dirname -- "$path")"
+		set_gpg_recipients "$(dirname -- "$path")"
+
+		$GPG -e "${GPG_RECIPIENT_ARGS[@]}" -o "$doxfile" "${GPG_OPTS[@]}" < "$input_file" || die "Document encryption aborted."
+
+		git_add_file "$doxfile" "Add document $path to store."
+	done
+}
+
+cmd_delete() {
+	local opts recursive="" force=0
+	opts="$($GETOPT -o rf -l recursive,force -n "$PROGRAM" -- "$@")"
+	local err=$?
+	eval set -- "$opts"
+	while true; do case $1 in
+		-r|--recursive) recursive="-r"; shift ;;
+		-f|--force) force=1; shift ;;
+		--) shift; break ;;
+	esac done
+	[[ $# -ne 1 ]] && die "Usage: $PROGRAM $COMMAND [--recursive,-r] [--force,-f] dox-name"
+	local path="$1"
+	check_sneaky_paths "$path"
+
+	local doxdir="$PREFIX/${path%/}"
+	local doxfile="$PREFIX/$path.gpg"
+	[[ -f $doxfile && -d $doxdir && $path == */ || ! -f $doxfile ]] && doxfile="${doxdir%/}/"
+	[[ -e $doxfile ]] || die "Error: $path is not in the document store."
+	set_git "$doxfile"
+
+	[[ $force -eq 1 ]] || yesno "Are you sure you would like to delete $path?"
+
+	rm $recursive -f -v "$doxfile"
+	set_git "$doxfile"
+	if [[ -n $INNER_GIT_DIR && ! -e $doxfile ]]; then
+		git -C "$INNER_GIT_DIR" rm -qr "$doxfile"
+		set_git "$doxfile"
+		git_commit "Remove $path from store."
+	fi
+	rmdir -p "${doxfile%/*}" 2>/dev/null
+}
+
+cmd_copy_move() {
+	local opts move=1 force=0
+	[[ $1 == "copy" ]] && move=0
+	shift
+	opts="$($GETOPT -o f -l force -n "$PROGRAM" -- "$@")"
+	local err=$?
+	eval set -- "$opts"
+	while true; do case $1 in
+		-f|--force) force=1; shift ;;
+		--) shift; break ;;
+	esac done
+	[[ $# -ne 2 ]] && die "Usage: $PROGRAM $COMMAND [--force,-f] old-path new-path"
+	check_sneaky_paths "$@"
+	local old_path="$PREFIX/${1%/}"
+	local old_dir="$old_path"
+	local new_path="$PREFIX/$2"
+
+	if ! [[ -f $old_path.gpg && -d $old_path && $1 == */ || ! -f $old_path.gpg ]]; then
+		old_dir="${old_path%/*}"
+		old_path="${old_path}.gpg"
+	fi
+	echo "$old_path"
+	[[ -e $old_path ]] || die "Error: $1 is not in the document store."
+
+	mkdir -p -v "${new_path%/*}"
+	[[ -d $old_path || -d $new_path || $new_path == */ ]] || new_path="${new_path}.gpg"
+
+	local interactive="-i"
+	[[ ! -t 0 || $force -eq 1 ]] && interactive="-f"
+
+	set_git "$new_path"
+	if [[ $move -eq 1 ]]; then
+		mv $interactive -v "$old_path" "$new_path" || exit 1
+		[[ -e "$new_path" ]] && reencrypt_path "$new_path"
+
+		set_git "$new_path"
+		if [[ -n $INNER_GIT_DIR && ! -e $old_path ]]; then
+			git -C "$INNER_GIT_DIR" rm -qr "$old_path" 2>/dev/null
+			set_git "$new_path"
+			git_add_file "$new_path" "Rename ${1} to ${2}."
+		fi
+		set_git "$old_path"
+		if [[ -n $INNER_GIT_DIR && ! -e $old_path ]]; then
+			git -C "$INNER_GIT_DIR" rm -qr "$old_path" 2>/dev/null
+			set_git "$old_path"
+			[[ -n $(git -C "$INNER_GIT_DIR" status --porcelain "$old_path") ]] && git_commit "Remove ${1}."
+		fi
+		rmdir -p "$old_dir" 2>/dev/null
+	else
+		cp $interactive -r -v "$old_path" "$new_path" || exit 1
+		[[ -e "$new_path" ]] && reencrypt_path "$new_path"
+		git_add_file "$new_path" "Copy ${1} to ${2}."
+	fi
+}
+
+cmd_git() {
+	set_git "$PREFIX/"
+	if [[ $1 == "init" ]]; then
+		INNER_GIT_DIR="$PREFIX"
+		git -C "$INNER_GIT_DIR" "$@" || exit 1
+		git_add_file "$PREFIX" "Add current contents of document store."
+
+		echo '*.gpg diff=gpg' > "$PREFIX/.gitattributes"
+		git_add_file .gitattributes "Configure git repository for gpg file diff."
+		git -C "$INNER_GIT_DIR" config --local diff.gpg.binary true
+		git -C "$INNER_GIT_DIR" config --local diff.gpg.textconv "$GPG -d ${GPG_OPTS[*]}"
+	elif [[ -n $INNER_GIT_DIR ]]; then
+		tmpdir nowarn #Defines $SECURE_TMPDIR. We don't warn, because at most, this only copies encrypted files.
+		export TMPDIR="$SECURE_TMPDIR"
+		git -C "$INNER_GIT_DIR" "$@"
+	else
+		die "Error: the document store is not a git repository. Try \"$PROGRAM git init\"."
+	fi
+}
+
+cmd_extension_or_show() {
+	if ! cmd_extension "$@"; then
+		COMMAND="show"
+		cmd_show "$@"
+	fi
+}
+
+SYSTEM_EXTENSION_DIR=""
+cmd_extension() {
+	check_sneaky_paths "$1"
+	local user_extension system_extension extension
+	[[ -n $SYSTEM_EXTENSION_DIR ]] && system_extension="$SYSTEM_EXTENSION_DIR/$1.bash"
+	[[ $PASSWORD_STORE_ENABLE_EXTENSIONS == true ]] && user_extension="$EXTENSIONS/$1.bash"
+	if [[ -n $user_extension && -f $user_extension && -x $user_extension ]]; then
+		verify_file "$user_extension"
+		extension="$user_extension"
+	elif [[ -n $system_extension && -f $system_extension && -x $system_extension ]]; then
+		extension="$system_extension"
+	else
+		return 1
+	fi
+	shift
+	source "$extension" "$@"
+	return 0
+}
+
+#
+# END subcommand functions
+#
+
+PROGRAM="${0##*/}"
+COMMAND="$1"
+
+case "$1" in
+	init) shift;			cmd_init "$@" ;;
+	help|--help) shift;		cmd_usage "$@" ;;
+	version|--version) shift;	cmd_version "$@" ;;
+	show|ls|list) shift;		cmd_show "$@" ;;
+	open) shift;			cmd_open "$@" ;;
+	find|search) shift;		cmd_find "$@" ;;
+	grep) shift;			cmd_grep "$@" ;;
+	insert|add) shift;		cmd_insert "$@" ;;
+	delete|rm|remove) shift;	cmd_delete "$@" ;;
+	rename|mv) shift;		cmd_copy_move "move" "$@" ;;
+	copy|cp) shift;			cmd_copy_move "copy" "$@" ;;
+	git) shift;			cmd_git "$@" ;;
+	*)				cmd_extension_or_show "$@" ;;
+esac
+exit 0
