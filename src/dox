@@ -392,7 +392,7 @@ cmd_insert() {
 	while [ "$1" ]; do
 		input_file="$1"; shift
 
-		local path="${subfolder%/}/$(basename -- $input_file)"
+		local path="${subfolder%/}/$(basename -- "$input_file")"
 		local doxfile="$PREFIX/$path.gpg"
 		check_sneaky_paths "$path"
 		set_git "$doxfile"
