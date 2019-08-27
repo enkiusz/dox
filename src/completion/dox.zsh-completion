@@ -1,0 +1,135 @@
+#compdef dox
+#autoload
+
+# Copyright (C) 2012 - 2014:
+#    Johan Venant <jvenant@invicem.pro>
+#    Brian Mattern <rephorm@rephorm.com>
+#    Jason A. Donenfeld <Jason@zx2c4.com>.
+# All Rights Reserved.
+# This file is licensed under the GPLv2+. Please see COPYING for more information.
+
+
+# If you use multiple repositories, you can configure completion like this:
+#
+# compdef _pass workpass
+# zstyle ':completion::complete:workpass::' prefix "$HOME/work/pass"
+# workpass() {
+#   PASSWORD_STORE_DIR=$HOME/work/pass pass $@
+# }
+
+
+_dox () {
+	local cmd
+	if (( CURRENT > 2)); then
+		cmd=${words[2]}
+		# Set the context for the subcommand.
+		curcontext="${curcontext%:*:*}:dox-$cmd"
+		# Narrow the range of words we are looking at to exclude `dox'
+		(( CURRENT-- ))
+		shift words
+		# Run the completion for the subcommand
+		case "${cmd}" in
+			init)
+				_arguments : \
+					"-p[gpg-id will only be applied to this subfolder]" \
+					"--path[gpg-id will only be applied to this subfolder]"
+				_dox_complete_keys
+				;;
+			ls|list)
+				_dox_complete_entries_with_subdirs
+				;;
+			open)
+				_arguments : \
+					"-e[edit]" \
+					"--edit[edit]"
+				_dox_complete_entries_with_subdirs
+				;;
+			insert|add)
+				_arguments : \
+					"-p[path]" \
+					"--path[path]"
+				_dox_complete_entries_with_subdirs
+				;;
+			cp|copy|mv|rename)
+				_arguments : \
+					"-f[force rename]" \
+					"--force[force rename]"
+					_dox_complete_entries_with_subdirs
+				;;
+			rm)
+				_arguments : \
+					"-f[force deletion]" \
+					"--force[force deletion]" \
+					"-r[recursively delete]" \
+					"--recursive[recursively delete]"
+					_dox_complete_entries_with_subdirs
+				;;
+			git)
+				local -a subcommands
+				subcommands=(
+					"init:Initialize git repository"
+					"push:Push to remote repository"
+					"pull:Pull from remote repository"
+					"config:Show git config"
+					"log:Show git log"
+					"reflog:Show git reflog"
+				)
+				_describe -t commands 'dox git' subcommands
+				;;
+			show|*)
+				_dox_cmd_show
+				;;
+		esac
+	else
+		local -a subcommands
+		subcommands=(
+			"init:Initialize new document storage"
+			"ls:List documents"
+			"find:Find document files or directories based on pattern"
+			"grep:Search inside decrypted document files for matching pattern"
+			"show:Decrypt and print a document"
+			"insert:Insert a new document"
+			"open:Edit a document with \$OPENER"
+			"mv:Rename the document"
+			"cp:Copy the document"
+			"rm:Remove the document"
+			"git:Call git on the document store"
+			"version:Output version information"
+			"help:Output help message"
+		)
+		_describe -t commands 'dox' subcommands
+		_arguments : \
+			"--version[Output version information]" \
+			"--help[Output help message]"
+		_dox_cmd_show
+	fi
+}
+
+_dox_cmd_show () {
+	_arguments : \
+		"-c[put it on the clipboard]" \
+		"--clip[put it on the clipboard]"
+	_dox_complete_entries
+}
+_dox_complete_entries_helper () {
+	local IFS=$'\n'
+	local prefix
+	zstyle -s ":completion:${curcontext}:" prefix prefix || prefix="${DOCUMENT_STORE_DIR:-$HOME/.document-store}"
+	_values -C 'documents' ${$(find -L "$prefix" \( -name .git -o -name .gpg-id \) -prune -o $@ -print 2>/dev/null | sed -e "s#${prefix}/\{0,1\}##" -e 's#\.gpg##' -e 's#\\#\\\\#' | sort):-""}
+}
+
+_dox_complete_entries_with_subdirs () {
+	_dox_complete_entries_helper
+}
+
+_dox_complete_entries () {
+	_dox_complete_entries_helper -type f
+}
+
+_dox_complete_keys () {
+	local IFS=$'\n'
+	# Extract names and email addresses from gpg --list-keys
+	_values 'gpg keys' $(gpg2 --list-secret-keys --with-colons | cut -d : -f 10 | sort -u | sed '/^$/d')
+}
+
+_dox
