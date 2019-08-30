@@ -221,14 +221,17 @@ cmd_usage() {
 	        Selectively reencrypt existing document using new gpg-id(s).
 	    $PROGRAM [ls] [subfolder]
 	        List documents as a tree.
-	    $PROGRAM open [-e,--edit] [-o command,--opencmd command] dox-name
-            1. Decrypt and extract the file into a temporary directory.
-            2. Launch the platform-dependent generic opener (open or xdg-open) on the file. 
+	    $PROGRAM open [-e,--edit] [-o command,--opencmd command] dox-name dox-name...
+            1. Decrypt and extract file(s) into a temporary directory.
+            2. Launch the platform-dependent generic opener (open, xdg-open by default, use -o to change) on the file(s). 
             3. When the opener process exits and reimport file contents (when -e flag is specified and file contents changed).
             4. Remove the temporary directory.
+
 			The command used to open a file can be specified using the -o or --opencmd options. A builtin 'showfile' command
 			will print the temporary file name and wait for input to let the user perform arbitrary actions with the file
-			(for example add it as an email attachment)
+			(for example add it as an email attachment).
+
+			Currently edit mode works only when there is a single document name provided.
 	    $PROGRAM grep [GREPOPTIONS] search-string
 	        Search for document files containing search-string when decrypted.
 	    $PROGRAM insert [--path=subfolder,-p subfolder] [-f,--force] filename1 filename2...
@@ -319,7 +322,9 @@ cmd_show() {
 
 # Builtin function to reveal file name and wait for input
 showfile() {
-	echo "$@"
+	for n in $*; do
+		echo $n
+	done
 	echo "Press Enter or Ctrl-D after you finish working with file" >&2
 	read dummy
 }
@@ -335,27 +340,54 @@ cmd_open() {
 		--) shift; break ;;
 	esac done
 
-	[[ $err -ne 0 || $# -lt 1 ]] && die "Usage: $PROGRAM $COMMAND [-e,--edit] [-o command,--opencmd command] dox-name"
+	[[ $err -ne 0 || $# -lt 1 ]] && die "Usage: $PROGRAM $COMMAND [-e,--edit] [-o command,--opencmd command] dox-name dox-name..."
 
-	local path="${1%/}"
-	check_sneaky_paths "$path"
-	set_gpg_recipients "$(dirname -- "$path")"
-	local doxfile="$PREFIX/$path.gpg"
-	set_git "$doxfile"
+	local totalsize=0
+	# First calculate sizes
+	for doxname in $@; do
+		local path="${doxname%/}";
+		check_sneaky_paths "$path"
+		local doxfile="$PREFIX/$path.gpg"
 
-	tmpdir --size=$(stat -f %z -- "$doxfile") #Defines $SECURE_TMPDIR
+		local size=$(stat -f %z -- "$doxfile")
+		totalsize=$(( totalsize + size ))
+	done
 
-	local tmp_file="$(mktemp -u "$SECURE_TMPDIR/XXXXXX")-${path//\//-}"
+	tmpdir --size=$totalsize #Defines $SECURE_TMPDIR
 
-	if [[ -f $doxfile ]]; then
-		$GPG -d -o "$tmp_file" "${GPG_OPTS[@]}" "$doxfile" || exit 1
-	else
-		die "Document $path doesn't exist."
-	fi
+	local tmpfiles=()
+	# Decrypt files into ramdisk
+	for doxname in $@; do
+		local path="${doxname%/}";
+		check_sneaky_paths "$path"
+		set_gpg_recipients "$(dirname -- "$path")"
+		local doxfile="$PREFIX/$path.gpg"
+		set_git "$doxfile"
 
-	${opencmd} "$tmp_file"
+		local tmp_file="$(mktemp -u "$SECURE_TMPDIR/XXXXXX")-${path//\//-}"
 
-	if [ -n "$edit" ]; then
+		if [[ -f $doxfile ]]; then
+			$GPG -d -o "$tmp_file" "${GPG_OPTS[@]}" "$doxfile" || exit 1
+			tmpfiles+=($tmp_file)
+		else
+			die "Document $path doesn't exist."
+		fi
+	done
+
+	# Open files
+	${opencmd} ${tmpfiles[*]}
+
+	if [ $# == 1 -a -n "$edit" ]; then
+		# We have a single document only, check if we need to reimport
+
+		local path="${1%/}";
+		check_sneaky_paths "$path"
+		set_gpg_recipients "$(dirname -- "$path")"
+		local doxfile="$PREFIX/$path.gpg"
+		set_git "$doxfile"
+
+		local tmp_file = ${tmpfiles[0]}
+
 		$GPG -d -o - "${GPG_OPTS[@]}" "$doxfile" 2>/dev/null | diff - "$tmp_file" &>/dev/null && die "Document unchanged."
 
 		while ! $GPG -e "${GPG_RECIPIENT_ARGS[@]}" -o "$doxfile" "${GPG_OPTS[@]}" "$tmp_file"; do
