@@ -221,11 +221,14 @@ cmd_usage() {
 	        Selectively reencrypt existing document using new gpg-id(s).
 	    $PROGRAM [ls] [subfolder]
 	        List documents as a tree.
-	    $PROGRAM open [-e,--edit] dox-name
+	    $PROGRAM open [-e,--edit] [-o command,--opencmd command] dox-name
             1. Decrypt and extract the file into a temporary directory.
             2. Launch the platform-dependent generic opener (open or xdg-open) on the file. 
             3. When the opener process exits and reimport file contents (when -e flag is specified and file contents changed).
             4. Remove the temporary directory.
+			The command used to open a file can be specified using the -o or --opencmd options. A builtin 'showfile' command
+			will print the temporary file name and wait for input to let the user perform arbitrary actions with the file
+			(for example add it as an email attachment)
 	    $PROGRAM grep [GREPOPTIONS] search-string
 	        Search for document files containing search-string when decrypted.
 	    $PROGRAM insert [--path=subfolder,-p subfolder] [-f,--force] filename1 filename2...
@@ -314,17 +317,25 @@ cmd_show() {
 	fi
 }
 
+# Builtin function to reveal file name and wait for input
+showfile() {
+	echo "$@"
+	echo "Press Enter or Ctrl-D after you finish working with file" >&2
+	read dummy
+}
+
 cmd_open() {
-	local opts edit=''
-	opts="$($GETOPT -o e -l edit -n "$PROGRAM" -- "$@")"
+	local opts edit='' opencmd="${OPENER}"
+	opts="$($GETOPT -o eo: -l opencmd:edit -n "$PROGRAM" -- "$@")"
 	local err=$?
 	eval set -- "$opts"
 	while true; do case $1 in
 		-e|--edit) edit="yes"; shift 1 ;;
+		-o|--opencmd) opencmd="$2"; shift 2 ;;
 		--) shift; break ;;
 	esac done
 
-	[[ $err -ne 0 || $# -lt 1 ]] && die "Usage: $PROGRAM $COMMAND [-e,--edit] dox-name"
+	[[ $err -ne 0 || $# -lt 1 ]] && die "Usage: $PROGRAM $COMMAND [-e,--edit] [-o command,--opencmd command] dox-name"
 
 	local path="${1%/}"
 	check_sneaky_paths "$path"
@@ -342,7 +353,7 @@ cmd_open() {
 		die "Document $path doesn't exist."
 	fi
 
-	${OPENER} "$tmp_file"
+	${opencmd} "$tmp_file"
 
 	if [ -n "$edit" ]; then
 		$GPG -d -o - "${GPG_OPTS[@]}" "$doxfile" 2>/dev/null | diff - "$tmp_file" &>/dev/null && die "Document unchanged."
