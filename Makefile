@@ -39,9 +39,9 @@ install:
 	@install -m 0755 -v src/dox "$(DESTDIR)/$(BINDIR)/dox"
 	sed -i'' -e 's:.*SYSTEM_EXTENSION_DIR=".*:SYSTEM_EXTENSION_DIR="$(DESTDIR)/$(LIBDIR)/dox/extensions":' "$(DESTDIR)/$(BINDIR)/dox"
 	sed -i'' -e 's:.*# LIBRARY_DIRECTORY.*:LIBDIR="$(DESTDIR)/$(LIBDIR)":' "$(DESTDIR)/$(BINDIR)/dox"
-	@[ "$(WITH_BASHCOMP)" = "yes" ] || exit 0; install -v -d "$(DESTDIR)$(BASHCOMPDIR)" && install -m 0644 -v src/completion/dox.bash-completion "$(DESTDIR)$(BASHCOMPDIR)/dox"
-	@[ "$(WITH_ZSHCOMP)" = "yes" ] || exit 0; install -v -d "$(DESTDIR)$(ZSHCOMPDIR)" && install -m 0644 -v src/completion/dox.zsh-completion "$(DESTDIR)$(ZSHCOMPDIR)/_dox"
-	@[ "$(WITH_FISHCOMP)" = "yes" ] || exit 0; install -v -d "$(DESTDIR)$(FISHCOMPDIR)" && install -m 0644 -v src/completion/dox.fish-completion "$(DESTDIR)$(FISHCOMPDIR)/dox.fish"
+	@[ "$(WITH_BASHCOMP)" = "yes" ] || exit 0; install -v -d "$(DESTDIR)/$(BASHCOMPDIR)" && install -m 0644 -v src/completion/dox.bash-completion "$(DESTDIR)/$(BASHCOMPDIR)/dox"
+	@[ "$(WITH_ZSHCOMP)" = "yes" ] || exit 0; install -v -d "$(DESTDIR)/$(ZSHCOMPDIR)" && install -m 0644 -v src/completion/dox.zsh-completion "$(DESTDIR)/$(ZSHCOMPDIR)/_dox"
+	@[ "$(WITH_FISHCOMP)" = "yes" ] || exit 0; install -v -d "$(DESTDIR)/$(FISHCOMPDIR)" && install -m 0644 -v src/completion/dox.fish-completion "$(DESTDIR)/$(FISHCOMPDIR)/dox.fish"
 
 
 uninstall:
